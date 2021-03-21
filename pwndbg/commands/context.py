@@ -206,6 +206,95 @@ def context_expressions(target=sys.stdout, with_banner=True, width=None):
         output.extend(lines)
     return banner + output if with_banner else output
 
+
+# allow rizin & rzpipe: 
+
+rizin = {}
+
+config_context_ghidra_rz = pwndbg.config.Parameter('context-ghidra-rizin',
+                                                  'never',
+                                                  'if or/when to try to decompile with '
+                                                  'ghidra (slow and requires rizin/rzpipe) '
+                                                  '(valid values: always, never, if-no-source)')
+def init_rizin(filename):
+    rz = rizin.get(filename)
+    if rz:
+        return rz
+    import rzpipe
+    rz = rzpipe.open(filename)
+    rizin[filename] = rz
+    rz.cmd("aaaa")
+    return rz
+
+parser_rz = argparse.ArgumentParser()
+parser_rz.description = """Show current function decompiled by ghidra"""
+parser_rz.add_argument("func", type=str, default=None, nargs="?",
+                    help="Function to be shown. Defaults to current")
+@pwndbg.commands.ArgparsedCommand(parser_rz, aliases=['ctx-ghidra-rz'])
+def contextghidra_rz(func):
+    print("\n".join(context_ghidra(func, with_banner=False, force_show=True)))
+
+def context_ghidra_rz(func=None, target=sys.stdout, with_banner=True, width=None, force_show=False):
+    banner = [pwndbg.ui.banner("ghidra decompile", target=target, width=width)]
+
+    if config_context_ghidra_rz == "never" and not force_show:
+        return []
+    elif config_context_ghidra_rz == "if-no-source" and not force_show:
+        try:
+            with open(gdb.selected_frame().find_sal().symtab.fullname()) as _:
+                pass
+        except:         # a lot can go wrong in search of source code.
+            return []   # we don't care what, just that it did not work out well...
+
+    filename = gdb.current_progspace().filename
+    try:
+        rz = init_rizin(filename)
+        # LD         list supported decompilers (e cmd.pdc=?)
+        # Outputs for example:: pdc\npdg
+        if not "pdg" in rz.cmd("LD").split("\n"):
+            return banner + ["rizin plugin rzghidra-dec must be installed and available from rizin"]
+    except ImportError: # no r2pipe present
+        return banner + ["rzpipe not available, but required for rz->ghidra-bridge"]
+    if func is None:
+        try:
+            func = hex(pwndbg.regs[pwndbg.regs.current.pc])
+        except:
+            func = "main"
+    src = rz.cmdj("pdgj @" + func)
+    source = src.get("code", "")
+    curline = None
+    try:
+        cur = pwndbg.regs[pwndbg.regs.current.pc]
+    except AttributeError:
+        cur = None # If not running there is no current.pc
+    if cur is not None:
+        closest = 0
+        for off in (a.get("offset", 0) for a in src.get("annotations", [])):
+            if abs(cur - closest) > abs(cur - off):
+                closest = off
+        pos_annotations = sorted([a for a in src.get("annotations", []) if a.get("offset") == closest],
+                         key=lambda a: a["start"])
+        if pos_annotations:
+            curline = source.count("\n", 0, pos_annotations[0]["start"])
+    source = source.split("\n")
+    # Append --> for the current line if possible
+    if curline is not None:
+        line = source[curline]
+        if line.startswith('    '):
+            line = line[4:]
+        source[curline] = '--> ' + line
+    # Join the source for highlighting
+    source = "\n".join(source)
+    if pwndbg.config.syntax_highlight:
+        # highlighting depends on the file extension to guess the language, so try to get one...
+        try: # try to read the source filename from debug information
+            src_filename = gdb.selected_frame().find_sal().symtab.fullname()
+        except: # if non, take the original filename and maybe append .c (just assuming is was c)
+            src_filename = filename+".c" if os.path.basename(filename).find(".") < 0 else filename
+        source = H.syntax_highlight(source, src_filename)
+    source = source.split("\n")
+    return banner + source if with_banner else source
+
 # Ghidra integration through radare2
 # This is not (sorry couldn't help it) "the yellow of the egg"
 # Using radare2 is suboptimal and will only be an intermediate step to have
